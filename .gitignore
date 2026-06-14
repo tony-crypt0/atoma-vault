@@ -1,0 +1,24 @@
+# Foundry build artifacts
+out/
+cache/
+broadcast/
+
+# Foundry dependencies (installed via `forge install`)
+lib/
+
+# Local environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
