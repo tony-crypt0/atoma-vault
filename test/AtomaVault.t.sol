@@ -36,7 +36,7 @@ contract AtomaVaultTest is Test {
         AtomaVault impl = new AtomaVault();
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(AtomaVault.initialize, (IERC20(address(usdc)), operatorAddr, operatorAddr))
+            abi.encodeCall(AtomaVault.initialize, (IERC20(address(usdc)), operatorAddr, operatorAddr, "Atoma Vault Share", "AVS"))
         );
         vault = AtomaVault(address(proxy));
 
@@ -50,6 +50,17 @@ contract AtomaVaultTest is Test {
         usdc.approve(address(vault), type(uint256).max);
         vm.prank(operatorAddr);
         usdc.approve(address(vault), type(uint256).max);
+
+        vm.startPrank(operatorAddr);
+        vault.setUpdateBounds(10000, 0);
+        vault.whitelistCapitalDestination(operatorAddr);
+        vm.stopPrank();
+    }
+
+    function _crystallize() internal {
+        vm.warp(block.timestamp + vault.FEE_CRYSTALLIZATION_PERIOD());
+        vm.prank(operatorAddr);
+        vault.crystallizePerformanceFee();
     }
 
     // ──────────── Deposit ────────────
@@ -85,7 +96,7 @@ contract AtomaVaultTest is Test {
         uint256 shares1 = vault.deposit(1000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(1100 * ONE_USDC);
+        vault.updateTotalAssets(int256(100 * ONE_USDC));
 
         vm.prank(bob);
         uint256 shares2 = vault.deposit(1000 * ONE_USDC, bob);
@@ -185,7 +196,7 @@ contract AtomaVaultTest is Test {
         vault.requestWithdrawal(shares + 1);
     }
 
-    function test_requestWithdrawal_revertsWhenPaused() public {
+    function test_requestWithdrawal_succeedsWhenPaused() public {
         vm.prank(alice);
         uint256 shares = vault.deposit(1000 * ONE_USDC, alice);
 
@@ -194,9 +205,28 @@ contract AtomaVaultTest is Test {
         vm.prank(operatorAddr);
         vault.pause();
 
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
         vm.prank(alice);
-        vm.expectRevert();
         vault.requestWithdrawal(shares);
+
+        assertEq(vault.userEpochShares(settlementEpoch, alice), shares);
+        assertEq(vault.balanceOf(address(vault)), shares);
+    }
+
+    function test_deposit_thirdPartyCannotExtendExistingLock() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+
+        vm.prank(bob);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        uint256 gifted = vault.balanceOf(alice) - aliceShares;
+        assertEq(vault.lockedShares(alice), gifted, "griefing deposit must lock only the gifted shares");
+
+        vm.prank(alice);
+        vault.requestWithdrawal(aliceShares);
     }
 
     // ──────────── Settle Epoch ────────────
@@ -327,13 +357,16 @@ contract AtomaVaultTest is Test {
         assertApproxEqAbs(opReceived, expectedFee, 1);
     }
 
-    function test_claimWithdrawal_burnShares() public {
+    function test_settleEpoch_burnsSharesAndExcludesLiabilities() public {
         vm.prank(alice);
-        uint256 shares = vault.deposit(1000 * ONE_USDC, alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(bob);
+        uint256 bobShares = vault.deposit(1000 * ONE_USDC, bob);
 
         vm.warp(block.timestamp + EPOCH_DURATION);
         vm.prank(alice);
-        vault.requestWithdrawal(shares);
+        vault.requestWithdrawal(aliceShares);
 
         uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
         vm.warp(block.timestamp + EPOCH_DURATION * 2);
@@ -341,11 +374,41 @@ contract AtomaVaultTest is Test {
         vm.prank(operatorAddr);
         vault.settleEpoch(settlementEpoch);
 
+        assertEq(vault.totalSupply(), bobShares);
+        assertApproxEqAbs(vault.totalAssets(), 1000 * ONE_USDC, 2);
+        assertApproxEqAbs(vault.settledUnclaimedAssets(), 1000 * ONE_USDC, 2);
+
         uint256 supplyBefore = vault.totalSupply();
         vm.prank(alice);
         vault.claimWithdrawal(settlementEpoch);
 
-        assertEq(vault.totalSupply(), supplyBefore - shares);
+        assertEq(vault.totalSupply(), supplyBefore);
+        assertApproxEqAbs(vault.totalAssets(), 1000 * ONE_USDC, 2);
+        assertApproxEqAbs(vault.settledUnclaimedAssets(), 0, 2);
+    }
+
+    function test_settleEpoch_escrowDoesNotDiluteNav() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(bob);
+        vault.deposit(1000 * ONE_USDC, bob);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(aliceShares);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+
+        vm.prank(operatorAddr);
+        vault.settleEpoch(settlementEpoch);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(100 * ONE_USDC));
+
+        uint256 navPerShare = vault.totalAssets() * 1e18 / vault.totalSupply();
+        assertApproxEqRel(navPerShare, 1.1e12, 0.001e18);
     }
 
     function test_claimWithdrawal_revertsIfNotSettled() public {
@@ -386,6 +449,7 @@ contract AtomaVaultTest is Test {
         vm.prank(alice);
         uint256 shares = vault.deposit(1000 * ONE_USDC, alice);
 
+        vm.warp(block.timestamp + vault.CAPITAL_WHITELIST_DELAY());
         vm.prank(operatorAddr);
         vault.capitalWithdraw(operatorAddr, 1000 * ONE_USDC);
 
@@ -406,37 +470,138 @@ contract AtomaVaultTest is Test {
 
     // ──────────── Update Total Assets + Fees ────────────
 
-    function test_updateTotalAssets_noFeeIfBelowHwm() public {
+    function test_updateTotalAssets_appliesDelta() public {
         vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, alice);
 
-        uint256 opSharesBefore = vault.balanceOf(operatorAddr);
-
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(900 * ONE_USDC);
+        vault.updateTotalAssets(-int256(100 * ONE_USDC));
 
-        assertEq(vault.balanceOf(operatorAddr), opSharesBefore);
         assertEq(vault.totalAssets(), 900 * ONE_USDC);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(50 * ONE_USDC));
+
+        assertEq(vault.totalAssets(), 950 * ONE_USDC);
     }
 
-    function test_updateTotalAssets_noFeeIfEqualHwm() public {
+    function test_updateTotalAssets_doesNotMintFee() public {
         vm.prank(alice);
-        vault.deposit(1000 * ONE_USDC, alice);
+        vault.deposit(10000 * ONE_USDC, alice);
 
         uint256 opSharesBefore = vault.balanceOf(operatorAddr);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(1000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
 
         assertEq(vault.balanceOf(operatorAddr), opSharesBefore);
     }
 
-    function test_updateTotalAssets_mintsFeeSharesAboveHwm() public {
+    function test_updateTotalAssets_revertsDeltaTooLarge() public {
+        vm.prank(operatorAddr);
+        vault.setUpdateBounds(100, 0);
+
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.UpdateDeltaTooLarge.selector);
+        vault.updateTotalAssets(int256(11 * ONE_USDC));
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(10 * ONE_USDC));
+    }
+
+    function test_updateTotalAssets_revertsTooFrequent() public {
+        vm.warp(block.timestamp + 1 days);
+
+        vm.prank(operatorAddr);
+        vault.setUpdateBounds(10000, 30 minutes);
+
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(10 * ONE_USDC));
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.UpdateTooFrequent.selector);
+        vault.updateTotalAssets(int256(10 * ONE_USDC));
+
+        vm.warp(block.timestamp + 30 minutes);
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(10 * ONE_USDC));
+    }
+
+    function test_updateTotalAssets_revertsIfNotOperator() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(alice);
+        vm.expectRevert(AtomaVault.NotOperator.selector);
+        vault.updateTotalAssets(int256(100 * ONE_USDC));
+    }
+
+    function test_resyncTotalAssets_ownerSetsAbsoluteTotal() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.startPrank(operatorAddr);
+        vault.pause();
+        vault.resyncTotalAssets(5000 * ONE_USDC);
+        vm.stopPrank();
+
+        assertEq(vault.totalAssets(), 5000 * ONE_USDC);
+    }
+
+    function test_resyncTotalAssets_revertsIfNotPaused() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert();
+        vault.resyncTotalAssets(5000 * ONE_USDC);
+    }
+
+    function test_resyncTotalAssets_revertsIfNotOwner() public {
+        vm.prank(alice);
+        vm.expectRevert();
+        vault.resyncTotalAssets(5000 * ONE_USDC);
+    }
+
+    // ──────────── Fee Crystallization ────────────
+
+    function test_crystallize_noFeeIfBelowHwm() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(-int256(100 * ONE_USDC));
+
+        uint256 opSharesBefore = vault.balanceOf(operatorAddr);
+        _crystallize();
+
+        assertEq(vault.balanceOf(operatorAddr), opSharesBefore);
+    }
+
+    function test_crystallize_noFeeIfEqualHwm() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        uint256 opSharesBefore = vault.balanceOf(operatorAddr);
+        _crystallize();
+
+        assertEq(vault.balanceOf(operatorAddr), opSharesBefore);
+    }
+
+    function test_crystallize_mintsFeeSharesAboveHwm() public {
         vm.prank(alice);
         vault.deposit(10000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         uint256 opShares = vault.balanceOf(operatorAddr);
         assertGt(opShares, 0);
@@ -446,40 +611,250 @@ contract AtomaVaultTest is Test {
         assertApproxEqRel(opValue, expectedFee, 0.01e18);
     }
 
-    function test_updateTotalAssets_updatesHwm() public {
+    function test_crystallize_updatesHwm() public {
         vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, alice);
 
         uint256 hwmBefore = vault.highWaterMark();
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(1100 * ONE_USDC);
+        vault.updateTotalAssets(int256(100 * ONE_USDC));
+
+        _crystallize();
 
         assertGt(vault.highWaterMark(), hwmBefore);
     }
 
-    function test_updateTotalAssets_noFeeAfterLoss() public {
+    function test_crystallize_noFeeAfterLoss() public {
         vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(1100 * ONE_USDC);
+        vault.updateTotalAssets(int256(100 * ONE_USDC));
 
+        _crystallize();
         uint256 hwmAfterProfit = vault.highWaterMark();
+        uint256 opSharesAfterProfit = vault.balanceOf(operatorAddr);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(1050 * ONE_USDC);
+        vault.updateTotalAssets(-int256(50 * ONE_USDC));
+
+        _crystallize();
 
         assertEq(vault.highWaterMark(), hwmAfterProfit);
+        assertEq(vault.balanceOf(operatorAddr), opSharesAfterProfit);
     }
 
-    function test_updateTotalAssets_revertsIfNotOperator() public {
+    function test_deposit_accruesFeeBeforeMint() public {
+        vm.prank(alice);
+        vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        uint256 hwmBefore = vault.highWaterMark();
+        vm.prank(bob);
+        vault.deposit(10000 * ONE_USDC, bob);
+
+        uint256 opShares = vault.balanceOf(operatorAddr);
+        assertGt(opShares, 0);
+        assertGt(vault.highWaterMark(), hwmBefore);
+
+        uint256 opValue = opShares * vault.totalAssets() / vault.totalSupply();
+        uint256 expectedFee = 1000 * ONE_USDC * 2000 / 10000;
+        assertApproxEqRel(opValue, expectedFee, 0.01e18);
+    }
+
+    function test_deposit_midPeriodDepositorUnaffectedByCrystallization() public {
+        vm.prank(alice);
+        vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        vm.prank(bob);
+        uint256 bobShares = vault.deposit(10000 * ONE_USDC, bob);
+
+        _crystallize();
+
+        uint256 bobValue = bobShares * vault.totalAssets() / vault.totalSupply();
+        assertApproxEqRel(bobValue, 10000 * ONE_USDC, 0.0001e18);
+    }
+
+    function test_deposit_noAccrualAtOrBelowHwm() public {
+        vm.prank(alice);
+        vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+        _crystallize();
+        uint256 opShares = vault.balanceOf(operatorAddr);
+        uint256 hwm = vault.highWaterMark();
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(-int256(500 * ONE_USDC));
+
+        vm.prank(bob);
+        vault.deposit(10000 * ONE_USDC, bob);
+
+        assertEq(vault.balanceOf(operatorAddr), opShares);
+        assertEq(vault.highWaterMark(), hwm);
+    }
+
+    function test_crystallize_nothingLeftAfterDepositAccrual() public {
+        vm.prank(alice);
+        vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        vm.prank(bob);
+        vault.deposit(10000 * ONE_USDC, bob);
+        uint256 opShares = vault.balanceOf(operatorAddr);
+
+        _crystallize();
+
+        assertEq(vault.balanceOf(operatorAddr), opShares);
+    }
+
+    function test_crystallize_revertsBeforePeriod() public {
         vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, alice);
 
+        vm.warp(block.timestamp + vault.FEE_CRYSTALLIZATION_PERIOD() - 1);
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.CrystallizationNotDue.selector);
+        vault.crystallizePerformanceFee();
+    }
+
+    function test_settleEpoch_chargesExitFeeAboveHwm() public {
         vm.prank(alice);
-        vm.expectRevert(AtomaVault.NotOperator.selector);
-        vault.updateTotalAssets(1100 * ONE_USDC);
+        uint256 shares = vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(shares);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+
+        uint256 hwmBefore = vault.highWaterMark();
+        uint256 crystallizedBefore = vault.lastCrystallizedAt();
+
+        vm.prank(operatorAddr);
+        vault.settleEpoch(settlementEpoch);
+
+        assertGt(vault.balanceOf(operatorAddr), 0);
+        assertEq(vault.highWaterMark(), hwmBefore);
+        assertEq(vault.lastCrystallizedAt(), crystallizedBefore);
+
+        (, uint256 nav,) = vault.getEpoch(settlementEpoch);
+        assertApproxEqRel(nav, 1.08e12, 0.001e18);
+    }
+
+    function test_settleEpoch_exitFeeDoesNotChangeRemainingNav() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(10000 * ONE_USDC, alice);
+
+        vm.prank(bob);
+        vault.deposit(10000 * ONE_USDC, bob);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(2000 * ONE_USDC));
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(aliceShares);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+
+        vm.prank(operatorAddr);
+        vault.settleEpoch(settlementEpoch);
+
+        uint256 navPerShare = vault.totalAssets() * 1e18 / vault.totalSupply();
+        assertApproxEqRel(navPerShare, 1.1e12, 0.001e18);
+    }
+
+    function test_updateTotalAssets_haircutsClaimsBelowLiabilities() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
+        vm.prank(bob);
+        vault.deposit(1000 * ONE_USDC, bob);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(aliceShares);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+
+        vm.prank(operatorAddr);
+        vault.settleEpoch(settlementEpoch);
+        assertEq(vault.settledUnclaimedAssets(), 1000 * ONE_USDC);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(-int256(1200 * ONE_USDC));
+
+        assertEq(vault.settledUnclaimedAssets(), 800 * ONE_USDC);
+        assertEq(vault.shortfallIndexWad(), 8e17);
+        assertEq(vault.totalAssets(), 0, "equity absorbs the loss before claimants");
+
+        uint256 balBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vault.claimWithdrawal(settlementEpoch);
+
+        assertEq(usdc.balanceOf(alice) - balBefore, 796 * ONE_USDC);
+        assertEq(vault.settledUnclaimedAssets(), 0);
+    }
+
+    function test_haircut_sparesEpochsSettledAfterwards() public {
+        vm.prank(alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
+        vm.prank(bob);
+        uint256 bobShares = vault.deposit(1000 * ONE_USDC, bob);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(aliceShares);
+        uint256 aliceEpoch = vault.getCurrentEpoch() + 1;
+
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+        vm.prank(operatorAddr);
+        vault.settleEpoch(aliceEpoch);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(-int256(1200 * ONE_USDC));
+        assertEq(vault.shortfallIndexWad(), 8e17);
+
+        vm.prank(operatorAddr);
+        vault.updateTotalAssets(int256(800 * ONE_USDC));
+
+        vm.prank(bob);
+        vault.requestWithdrawal(bobShares);
+        uint256 bobEpoch = vault.getCurrentEpoch() + 1;
+
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+        vm.prank(operatorAddr);
+        vault.settleEpoch(bobEpoch);
+
+        assertEq(vault.epochIndexAtSettle(bobEpoch), 8e17, "new cohort snapshots the current index");
+        assertEq(vault.epochIndexAtSettle(aliceEpoch), 1e18);
+
+        uint256 aliceBefore = usdc.balanceOf(alice);
+        vm.prank(alice);
+        vault.claimWithdrawal(aliceEpoch);
+        assertEq(usdc.balanceOf(alice) - aliceBefore, 796 * ONE_USDC, "alice eats the shortfall");
+
+        uint256 bobBefore = usdc.balanceOf(bob);
+        vm.prank(bob);
+        vault.claimWithdrawal(bobEpoch);
+        assertEq(usdc.balanceOf(bob) - bobBefore, 796 * ONE_USDC, "bob priced in after the write-down, no second haircut");
+
+        assertEq(vault.settledUnclaimedAssets(), 0);
     }
 
     // ──────────── Capital Management (owner only) ────────────
@@ -490,6 +865,7 @@ contract AtomaVaultTest is Test {
 
         uint256 totalBefore = vault.totalAssets();
 
+        vm.warp(block.timestamp + vault.CAPITAL_WHITELIST_DELAY());
         vm.prank(operatorAddr);
         vault.capitalWithdraw(operatorAddr, 500 * ONE_USDC);
 
@@ -500,6 +876,7 @@ contract AtomaVaultTest is Test {
         vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, alice);
 
+        vm.warp(block.timestamp + vault.CAPITAL_WHITELIST_DELAY());
         vm.prank(operatorAddr);
         vault.capitalWithdraw(operatorAddr, 500 * ONE_USDC);
 
@@ -509,6 +886,63 @@ contract AtomaVaultTest is Test {
         vault.capitalDeposit(500 * ONE_USDC);
 
         assertEq(vault.totalAssets(), totalBefore);
+    }
+
+    function test_capitalWithdraw_revertsIfNotWhitelisted() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.DestinationNotWhitelisted.selector);
+        vault.capitalWithdraw(bob, 500 * ONE_USDC);
+    }
+
+    function test_capitalWithdraw_revertsBeforeWhitelistDelay() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.prank(operatorAddr);
+        vault.whitelistCapitalDestination(bob);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.DestinationNotWhitelisted.selector);
+        vault.capitalWithdraw(bob, 500 * ONE_USDC);
+
+        vm.warp(block.timestamp + vault.CAPITAL_WHITELIST_DELAY());
+        vm.prank(operatorAddr);
+        vault.capitalWithdraw(bob, 500 * ONE_USDC);
+    }
+
+    function test_capitalWithdraw_revertsAfterRevoke() public {
+        vm.prank(alice);
+        vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.warp(block.timestamp + vault.CAPITAL_WHITELIST_DELAY());
+        vm.prank(operatorAddr);
+        vault.revokeCapitalDestination(operatorAddr);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.DestinationNotWhitelisted.selector);
+        vault.capitalWithdraw(operatorAddr, 500 * ONE_USDC);
+    }
+
+    function test_capitalWithdraw_cannotTakeSettledLiabilities() public {
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1000 * ONE_USDC, alice);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+        vm.prank(alice);
+        vault.requestWithdrawal(shares);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.warp(block.timestamp + EPOCH_DURATION * 2);
+
+        vm.prank(operatorAddr);
+        vault.settleEpoch(settlementEpoch);
+
+        vm.prank(operatorAddr);
+        vm.expectRevert(AtomaVault.InsufficientIdle.selector);
+        vault.capitalWithdraw(operatorAddr, 100 * ONE_USDC);
     }
 
     function test_capitalWithdraw_revertsIfNotOwner() public {
@@ -536,7 +970,7 @@ contract AtomaVaultTest is Test {
         uint256 bobShares = vault.deposit(10000 * ONE_USDC, bob);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(22000 * ONE_USDC);
+        vault.updateTotalAssets(int256(2000 * ONE_USDC));
 
         vm.warp(block.timestamp + EPOCH_DURATION);
 
@@ -601,14 +1035,14 @@ contract AtomaVaultTest is Test {
         assertEq(vault.getCurrentEpoch(), 0);
     }
 
-    function test_getCurrentEpoch_afterOneWeek() public {
-        vm.warp(block.timestamp + EPOCH_DURATION);
+    function test_getCurrentEpoch_afterOneHour() public {
+        vm.warp(block.timestamp + 1 hours);
         assertEq(vault.getCurrentEpoch(), 1);
     }
 
     function test_getEpochEndTime() public view {
         uint256 end0 = vault.getEpochEndTime(0);
-        assertEq(end0, vault.genesisTimestamp() + EPOCH_DURATION);
+        assertEq(end0, vault.genesisTimestamp() + 1 hours);
     }
 
     // ──────────── Pause ────────────
@@ -677,22 +1111,11 @@ contract AtomaVaultTest is Test {
         uint256 opSharesBefore = vault.balanceOf(operatorAddr);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         assertGt(vault.balanceOf(operatorAddr), opSharesBefore);
-    }
-
-    function test_hwm_feeAmountIsCorrect() public {
-        vm.prank(alice);
-        vault.deposit(10000 * ONE_USDC, alice);
-
-        vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
-
-        uint256 opShares = vault.balanceOf(operatorAddr);
-        uint256 opValue = opShares * vault.totalAssets() / vault.totalSupply();
-        uint256 expectedFee = 1000 * ONE_USDC * 2000 / 10000;
-        assertApproxEqRel(opValue, expectedFee, 0.01e18);
     }
 
     function test_hwm_noFeeOnLossRecovery() public {
@@ -700,16 +1123,20 @@ contract AtomaVaultTest is Test {
         vault.deposit(10000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         uint256 hwmAfterProfit = vault.highWaterMark();
         uint256 opSharesAfterProfit = vault.balanceOf(operatorAddr);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(10500 * ONE_USDC);
+        vault.updateTotalAssets(-int256(500 * ONE_USDC));
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(10800 * ONE_USDC);
+        vault.updateTotalAssets(int256(300 * ONE_USDC));
+
+        _crystallize();
 
         assertEq(vault.highWaterMark(), hwmAfterProfit);
         assertEq(vault.balanceOf(operatorAddr), opSharesAfterProfit);
@@ -720,7 +1147,9 @@ contract AtomaVaultTest is Test {
         vault.deposit(10000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         uint256 opSharesAfterFee = vault.balanceOf(operatorAddr);
         uint256 hwmAfterFee = vault.highWaterMark();
@@ -730,8 +1159,7 @@ contract AtomaVaultTest is Test {
 
         assertEq(vault.balanceOf(operatorAddr), opSharesAfterFee);
 
-        vm.prank(operatorAddr);
-        vault.updateTotalAssets(16000 * ONE_USDC);
+        _crystallize();
 
         assertEq(vault.highWaterMark(), hwmAfterFee);
         assertEq(vault.balanceOf(operatorAddr), opSharesAfterFee);
@@ -742,12 +1170,16 @@ contract AtomaVaultTest is Test {
         vault.deposit(10000 * ONE_USDC, alice);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(11000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         uint256 opSharesFirst = vault.balanceOf(operatorAddr);
 
         vm.prank(operatorAddr);
-        vault.updateTotalAssets(12000 * ONE_USDC);
+        vault.updateTotalAssets(int256(1000 * ONE_USDC));
+
+        _crystallize();
 
         assertGt(vault.balanceOf(operatorAddr), opSharesFirst);
     }
@@ -857,27 +1289,44 @@ contract AtomaVaultTest is Test {
         assertApproxEqAbs(valueBack, 1000 * ONE_USDC, 1);
     }
 
-    // ──────────── Deposit Epoch Griefing Protection ────────────
+    // ──────────── Deposit Epoch Lock ────────────
 
-    function test_depositOnBehalf_doesNotLockReceiver() public {
+    function test_depositOnBehalf_doesNotRelockExistingReceiver() public {
         vm.prank(alice);
-        vault.deposit(1000 * ONE_USDC, alice);
+        uint256 aliceShares = vault.deposit(1000 * ONE_USDC, alice);
 
         vm.warp(block.timestamp + EPOCH_DURATION);
 
         vm.prank(bob);
         vault.deposit(MIN_DEPOSIT, alice);
 
-        uint256 aliceShares = vault.balanceOf(alice);
+        uint256 total = vault.balanceOf(alice);
+        vm.prank(alice);
+        vm.expectRevert(AtomaVault.DepositLocked.selector);
+        vault.requestWithdrawal(total);
+
         vm.prank(alice);
         vault.requestWithdrawal(aliceShares);
     }
 
-    function test_depositOnBehalf_locksSender() public {
+    function test_depositOnBehalf_doesNotLockSender() public {
+        vm.prank(bob);
+        vault.deposit(1000 * ONE_USDC, bob);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+
         vm.prank(bob);
         vault.deposit(MIN_DEPOSIT, alice);
 
+        uint256 bobShares = vault.balanceOf(bob);
         vm.prank(bob);
+        vault.requestWithdrawal(bobShares);
+    }
+
+    function test_depositLockBypass_viaReceiver_prevented() public {
+        vm.warp(block.timestamp + EPOCH_DURATION);
+
+        vm.prank(alice);
         vault.deposit(1000 * ONE_USDC, bob);
 
         uint256 bobShares = vault.balanceOf(bob);
@@ -981,5 +1430,33 @@ contract AtomaVaultTest is Test {
         vm.prank(alice);
         vm.expectRevert(AtomaVault.TransferDisabled.selector);
         vault.transfer(bob, aliceShares);
+    }
+
+    function test_transfer_toVaultReverts() public {
+        vm.prank(alice);
+        uint256 shares = vault.deposit(1000 * ONE_USDC, alice);
+        vm.warp(block.timestamp + EPOCH_DURATION);
+
+        vm.prank(alice);
+        vm.expectRevert(AtomaVault.TransferDisabled.selector);
+        vault.transfer(address(vault), shares);
+    }
+
+    // ──────────── Deposit Lock ────────────
+
+    function test_deposit_topUpDoesNotRelockExistingShares() public {
+        vm.prank(alice);
+        uint256 oldShares = vault.deposit(50_000 * ONE_USDC, alice);
+
+        vm.warp(block.timestamp + EPOCH_DURATION);
+
+        vm.prank(alice);
+        vault.deposit(100 * ONE_USDC, alice);
+
+        uint256 settlementEpoch = vault.getCurrentEpoch() + 1;
+        vm.prank(alice);
+        vault.requestWithdrawal(oldShares);
+
+        assertEq(vault.userEpochShares(settlementEpoch, alice), oldShares);
     }
 }

@@ -14,6 +14,8 @@ contract DeployMainnet is Script {
         uint256 deployerPk = vm.envUint("DEPLOYER_PRIVATE_KEY");
         address operator = vm.envAddress("OPERATOR_ADDRESS");
         address owner = vm.envAddress("OWNER_ADDRESS");
+        string memory name_ = vm.envOr("NAME", string("Atoma Vault Share"));
+        string memory symbol_ = vm.envOr("SYMBOL", string("AVS"));
         address deployer = vm.addr(deployerPk);
 
         require(operator != address(0), "OPERATOR_ADDRESS unset");
@@ -27,7 +29,7 @@ contract DeployMainnet is Script {
 
         bytes memory initData = abi.encodeCall(
             AtomaVault.initialize,
-            (IERC20(USDC), deployer, operator)
+            (IERC20(USDC), deployer, operator, name_, symbol_)
         );
 
         ERC1967Proxy proxy = new ERC1967Proxy(address(impl), initData);

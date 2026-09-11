@@ -27,7 +27,7 @@ contract AtomaVaultUpgradeV2Test is Test {
         AtomaVault impl = new AtomaVault();
         ERC1967Proxy proxy = new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(AtomaVault.initialize, (IERC20(address(usdc)), ownerAddr, operatorAddr))
+            abi.encodeCall(AtomaVault.initialize, (IERC20(address(usdc)), ownerAddr, operatorAddr, "Atoma Vault Share", "AVS"))
         );
         vault = AtomaVault(address(proxy));
 
@@ -40,6 +40,21 @@ contract AtomaVaultUpgradeV2Test is Test {
         assertEq(vault.epochDuration(), 1 hours);
         assertEq(vault.scheduleCount(), 1);
         assertEq(vault.getCurrentEpoch(), 0);
+    }
+
+    function test_initializeV2_revertsWhenSchedulesExist() public {
+        vm.prank(ownerAddr);
+        vm.expectRevert(AtomaVault.SchedulesAlreadyInitialized.selector);
+        vault.initializeV2();
+    }
+
+    function test_initializeV2_revertsAfterEpochDurationChange() public {
+        vm.prank(ownerAddr);
+        vault.setEpochDuration(7 days);
+
+        vm.prank(ownerAddr);
+        vm.expectRevert(AtomaVault.SchedulesAlreadyInitialized.selector);
+        vault.initializeV2();
     }
 
     function test_setEpochDuration_revertsIfNotOwner() public {

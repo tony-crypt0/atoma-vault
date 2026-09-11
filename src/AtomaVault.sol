@@ -18,6 +18,12 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     uint64 public constant MIN_EPOCH_DURATION = 1 hours;
     uint64 public constant MAX_EPOCH_DURATION = 30 days;
 
+    uint256 public constant FEE_CRYSTALLIZATION_PERIOD = 7 days;
+    uint256 public constant CAPITAL_WHITELIST_DELAY = 24 hours;
+    uint256 public constant DEFAULT_MAX_UPDATE_DELTA_BPS = 200;
+    uint64 public constant DEFAULT_MIN_UPDATE_INTERVAL = 30 minutes;
+    uint64 public constant MAX_MIN_UPDATE_INTERVAL = 1 days;
+
     uint256 private _totalManagedAssets;
     uint256 public highWaterMark;
     uint256 public genesisTimestamp;
@@ -44,6 +50,18 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
 
     EpochSchedule[] private _schedules;
 
+    uint256 public maxUpdateDeltaBps;
+    uint64 public minUpdateInterval;
+    uint64 public lastUpdateAt;
+    uint64 public lastCrystallizedAt;
+    uint256 public settledUnclaimedAssets;
+    mapping(address => uint256) public capitalDestinationActiveAt;
+
+    mapping(address => uint256) public lockedShares;
+    uint256 private _shortfallIndexWad;
+    mapping(uint256 => uint256) private _epochIndexAtSettle;
+    bool private _escrowUnlocked;
+
     event WithdrawalRequested(address indexed user, uint256 shares, uint256 requestEpoch, uint256 settlementEpoch);
     event EpochSettled(uint256 indexed epochId, uint256 settlementNav, uint256 totalShares);
     event WithdrawalClaimed(address indexed user, uint256 indexed epochId, uint256 shares, uint256 assets, uint256 fee);
@@ -52,6 +70,10 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     event OperatorUpdated(address indexed oldOperator, address indexed newOperator);
     event MaxTotalAssetsUpdated(uint256 newCap);
     event EpochDurationScheduled(uint64 newDuration, uint256 startEpochId, uint256 startTimestamp);
+    event UpdateBoundsUpdated(uint256 maxDeltaBps, uint64 minInterval);
+    event CapitalDestinationWhitelisted(address indexed destination, uint256 activeAt);
+    event CapitalDestinationRevoked(address indexed destination);
+    event ClaimsHaircut(uint256 newIndexWad, uint256 remainingLiabilities);
 
     error NotOperator();
     error DepositLocked();
@@ -69,6 +91,12 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     error ZeroAddress();
     error TransferDisabled();
     error EpochDurationOutOfBounds();
+    error UpdateTooFrequent();
+    error UpdateDeltaTooLarge();
+    error CrystallizationNotDue();
+    error DestinationNotWhitelisted();
+    error SchedulesAlreadyInitialized();
+    error InvalidBounds();
 
     modifier onlyOperator() {
         if (msg.sender != operator) revert NotOperator();
@@ -80,13 +108,13 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
         _disableInitializers();
     }
 
-    function initialize(IERC20 asset_, address owner_, address operator_) public initializer {
+    function initialize(IERC20 asset_, address owner_, address operator_, string memory name_, string memory symbol_) public initializer {
         if (address(asset_) == address(0)) revert ZeroAddress();
         if (owner_ == address(0)) revert ZeroAddress();
         if (operator_ == address(0)) revert ZeroAddress();
 
         __ERC4626_init(asset_);
-        __ERC20_init("Atoma Vault Share", "AVS");
+        __ERC20_init(name_, symbol_);
         __Pausable_init();
         __Ownable_init(owner_);
 
@@ -100,15 +128,28 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
             duration: 1 hours,
             _reserved: 0
         }));
+
+        _seedNavControls();
+    }
+
+    function _seedNavControls() internal {
+        maxUpdateDeltaBps = DEFAULT_MAX_UPDATE_DELTA_BPS;
+        minUpdateInterval = DEFAULT_MIN_UPDATE_INTERVAL;
+        lastCrystallizedAt = uint64(block.timestamp);
     }
 
     function initializeV2() external reinitializer(2) onlyOwner {
+        if (_schedules.length != 0) revert SchedulesAlreadyInitialized();
         _schedules.push(EpochSchedule({
             startTimestamp: uint64(genesisTimestamp),
             startEpochId: 0,
             duration: 1 hours,
             _reserved: 0
         }));
+    }
+
+    function initializeV3() external reinitializer(3) onlyOwner {
+        _seedNavControls();
     }
 
     // Views
@@ -157,8 +198,20 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
         return (e.totalSharesRequested, e.settlementNav, e.settled);
     }
 
+    /// @dev A zero slot means "no shortfall has ever been recorded" — either the vault has always
+    ///      been solvent, or V4 storage was never seeded. Both read as a full, unhaircut claim.
+    function shortfallIndexWad() public view returns (uint256) {
+        uint256 idx = _shortfallIndexWad;
+        return idx == 0 ? NAV_PRECISION : idx;
+    }
+
+    function epochIndexAtSettle(uint256 epochId) public view returns (uint256) {
+        uint256 idx = _epochIndexAtSettle[epochId];
+        return idx == 0 ? NAV_PRECISION : idx;
+    }
+
     function totalAssets() public view override returns (uint256) {
-        return _totalManagedAssets;
+        return _totalManagedAssets - settledUnclaimedAssets;
     }
 
     // ERC-4626 Overrides
@@ -170,27 +223,38 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     function _update(address from, address to, uint256 value) internal override {
         bool isMint = from == address(0);
         bool isBurn = to == address(0);
-        bool isVaultTransfer = from == address(this) || to == address(this);
-        if (!isMint && !isBurn && !isVaultTransfer) revert TransferDisabled();
+        bool isEscrow = to == address(this) && _escrowUnlocked;
+        if (!isMint && !isBurn && !isEscrow) revert TransferDisabled();
         super._update(from, to, value);
+    }
+
+    function _applyDepositLock(address receiver, uint256 shares) internal {
+        uint256 ep = getCurrentEpoch();
+        if (depositEpoch[receiver] != ep) {
+            depositEpoch[receiver] = ep;
+            lockedShares[receiver] = 0;
+        }
+        lockedShares[receiver] += shares;
     }
 
     function deposit(uint256 assets, address receiver) public override whenNotPaused returns (uint256) {
         if (assets < MIN_DEPOSIT) revert BelowMinDeposit();
         if (maxTotalAssets > 0 && _totalManagedAssets + assets > maxTotalAssets) revert DepositCapExceeded();
+        _accrueFee();
         uint256 shares = super.deposit(assets, receiver);
         _totalManagedAssets += assets;
-        depositEpoch[msg.sender] = getCurrentEpoch();
+        _applyDepositLock(receiver, shares);
         return shares;
     }
 
     function mint(uint256 shares, address receiver) public override whenNotPaused returns (uint256) {
+        _accrueFee();
         uint256 assets = previewMint(shares);
         if (assets < MIN_DEPOSIT) revert BelowMinDeposit();
         if (maxTotalAssets > 0 && _totalManagedAssets + assets > maxTotalAssets) revert DepositCapExceeded();
         assets = super.mint(shares, receiver);
         _totalManagedAssets += assets;
-        depositEpoch[msg.sender] = getCurrentEpoch();
+        _applyDepositLock(receiver, shares);
         return assets;
     }
 
@@ -226,13 +290,18 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
 
     // Epoch-Based Withdrawals
 
-    function requestWithdrawal(uint256 shares) external whenNotPaused {
+    function requestWithdrawal(uint256 shares) external {
         uint256 currentEp = getCurrentEpoch();
-        if (depositEpoch[msg.sender] >= currentEp) revert DepositLocked();
         if (shares == 0) revert ZeroShares();
-        if (balanceOf(msg.sender) < shares) revert InsufficientShares();
+        uint256 balance = balanceOf(msg.sender);
+        if (balance < shares) revert InsufficientShares();
 
+        uint256 locked = depositEpoch[msg.sender] >= currentEp ? lockedShares[msg.sender] : 0;
+        if (shares > (balance > locked ? balance - locked : 0)) revert DepositLocked();
+
+        _escrowUnlocked = true;
         _transfer(msg.sender, address(this), shares);
+        _escrowUnlocked = false;
 
         uint256 settlementEpoch = currentEp + 1;
         userEpochShares[settlementEpoch][msg.sender] += shares;
@@ -242,17 +311,35 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     }
 
     function settleEpoch(uint256 epochId) external onlyOperator {
+        EpochData storage e = _epochs[epochId];
         if (getCurrentEpoch() <= epochId) revert EpochNotEnded();
-        if (_epochs[epochId].settled) revert EpochAlreadySettled();
-        if (_epochs[epochId].totalSharesRequested == 0) revert EpochNoRequests();
+        if (e.settled) revert EpochAlreadySettled();
+        uint256 sharesRequested = e.totalSharesRequested;
+        if (sharesRequested == 0) revert EpochNoRequests();
 
-        uint256 supply = totalSupply();
-        uint256 nav = supply > 0 ? _totalManagedAssets * NAV_PRECISION / supply : NAV_PRECISION;
+        uint256 navGross = totalAssets() * NAV_PRECISION / totalSupply();
+        uint256 nav = navGross;
 
-        _epochs[epochId].settlementNav = nav;
-        _epochs[epochId].settled = true;
+        if (navGross > highWaterMark) {
+            uint256 feePerShare = (navGross - highWaterMark) * PERFORMANCE_FEE_BPS / 10000;
+            nav = navGross - feePerShare;
 
-        emit EpochSettled(epochId, nav, _epochs[epochId].totalSharesRequested);
+            uint256 feeAssets = sharesRequested * feePerShare / NAV_PRECISION;
+            if (feeAssets > 0) {
+                uint256 feeShares = feeAssets * NAV_PRECISION / navGross;
+                _mint(operator, feeShares);
+                emit PerformanceFeeCharged(feeShares, highWaterMark);
+            }
+        }
+
+        e.settlementNav = nav;
+        e.settled = true;
+        _epochIndexAtSettle[epochId] = shortfallIndexWad();
+
+        _burn(address(this), sharesRequested);
+        settledUnclaimedAssets += sharesRequested * nav / NAV_PRECISION;
+
+        emit EpochSettled(epochId, nav, sharesRequested);
     }
 
     function claimWithdrawal(uint256 epochId) external {
@@ -263,14 +350,18 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
         userEpochShares[epochId][msg.sender] = 0;
 
         uint256 assets = shares * _epochs[epochId].settlementNav / NAV_PRECISION;
+        uint256 idxAtSettle = epochIndexAtSettle(epochId);
+        uint256 idxNow = shortfallIndexWad();
+        if (idxNow < idxAtSettle) assets = assets * idxNow / idxAtSettle;
+
         uint256 fee = assets * WITHDRAWAL_FEE_BPS / 10000;
         uint256 payout = assets - fee;
 
         IERC20 token = IERC20(asset());
         if (token.balanceOf(address(this)) < assets) revert InsufficientIdle();
 
-        _burn(address(this), shares);
         _totalManagedAssets -= assets;
+        settledUnclaimedAssets -= assets;
 
         token.safeTransfer(msg.sender, payout);
         if (fee > 0) {
@@ -281,36 +372,92 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
     }
 
     // NAV + Fee Management
-    function updateTotalAssets(uint256 newTotal) external onlyOperator {
-        uint256 supply = totalSupply();
+    function updateTotalAssets(int256 pnlDelta) external onlyOperator {
+        if (block.timestamp < lastUpdateAt + minUpdateInterval) revert UpdateTooFrequent();
 
-        if (supply > 0) {
-            uint256 newNav = newTotal * NAV_PRECISION / supply;
+        uint256 current = _totalManagedAssets;
+        uint256 magnitude = pnlDelta < 0 ? uint256(-pnlDelta) : uint256(pnlDelta);
+        if (magnitude > current * maxUpdateDeltaBps / 10000) revert UpdateDeltaTooLarge();
 
-            if (newNav > highWaterMark) {
-                uint256 profit = (newNav - highWaterMark) * supply / NAV_PRECISION;
-                uint256 feeAssets = profit * PERFORMANCE_FEE_BPS / 10000;
+        lastUpdateAt = uint64(block.timestamp);
+        _setTotalAssets(pnlDelta < 0 ? current - magnitude : current + magnitude);
+    }
 
-                if (feeAssets > 0) {
-                    uint256 feeShares = feeAssets * supply / (newTotal - feeAssets);
-                    _mint(operator, feeShares);
-
-                    supply = totalSupply();
-                    highWaterMark = newTotal * NAV_PRECISION / supply;
-
-                    emit PerformanceFeeCharged(feeShares, highWaterMark);
-                }
-            }
-
-            emit TotalAssetsUpdated(newTotal, newTotal * NAV_PRECISION / totalSupply(), block.timestamp);
+    function _setTotalAssets(uint256 newTotal) internal {
+        uint256 liabilities = settledUnclaimedAssets;
+        if (liabilities > 0 && newTotal < liabilities) {
+            uint256 scaled = shortfallIndexWad() * newTotal / liabilities;
+            _shortfallIndexWad = scaled == 0 ? 1 : scaled;
+            settledUnclaimedAssets = newTotal;
+            emit ClaimsHaircut(_shortfallIndexWad, newTotal);
         }
-
         _totalManagedAssets = newTotal;
+        uint256 supply = totalSupply();
+        emit TotalAssetsUpdated(newTotal, supply > 0 ? totalAssets() * NAV_PRECISION / supply : 0, block.timestamp);
+    }
+
+    function crystallizePerformanceFee() external onlyOperator {
+        if (block.timestamp < lastCrystallizedAt + FEE_CRYSTALLIZATION_PERIOD) revert CrystallizationNotDue();
+        lastCrystallizedAt = uint64(block.timestamp);
+        _accrueFee();
+    }
+
+    function _accrueFee() internal {
+        uint256 supply = totalSupply();
+        if (supply == 0) return;
+
+        uint256 total = totalAssets();
+        uint256 nav = total * NAV_PRECISION / supply;
+        if (nav <= highWaterMark) return;
+
+        uint256 profit = (nav - highWaterMark) * supply / NAV_PRECISION;
+        uint256 feeAssets = profit * PERFORMANCE_FEE_BPS / 10000;
+        if (feeAssets == 0) return;
+
+        uint256 feeShares = feeAssets * supply / (total - feeAssets);
+        if (feeShares == 0) return;
+        _mint(operator, feeShares);
+
+        highWaterMark = totalAssets() * NAV_PRECISION / totalSupply();
+        emit PerformanceFeeCharged(feeShares, highWaterMark);
     }
 
     // Owner only
+    function resyncTotalAssets(uint256 newTotal) external onlyOwner whenPaused {
+        _setTotalAssets(newTotal);
+    }
+
+    function setUpdateBounds(uint256 maxDeltaBps, uint64 minInterval) external onlyOwner {
+        if (maxDeltaBps == 0 || maxDeltaBps > 10000 || minInterval > MAX_MIN_UPDATE_INTERVAL) revert InvalidBounds();
+        maxUpdateDeltaBps = maxDeltaBps;
+        minUpdateInterval = minInterval;
+        emit UpdateBoundsUpdated(maxDeltaBps, minInterval);
+    }
+
+    function whitelistCapitalDestination(address to) external onlyOwner {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 activeAt = block.timestamp + CAPITAL_WHITELIST_DELAY;
+        capitalDestinationActiveAt[to] = activeAt;
+        emit CapitalDestinationWhitelisted(to, activeAt);
+    }
+
+    function revokeCapitalDestination(address to) external onlyOwner {
+        capitalDestinationActiveAt[to] = 0;
+        emit CapitalDestinationRevoked(to);
+    }
+
+    /// @notice Moves idle assets out to a whitelisted destination so they can be deployed to the
+    ///         off-chain trading venue, which only accepts deposits from the project wallet.
+    /// @dev ACCEPTED DESIGN — not a vulnerability. This vault custodies assets off-chain, so the
+    ///      owner (Gnosis Safe) MUST be able to withdraw custodied funds; there is no trustless
+    ///      variant of this flow. Guards: 24h destination whitelist delay + settled withdrawal
+    ///      liabilities reserved below. Do not "fix" by removing owner capital access.
     function capitalWithdraw(address to, uint256 amount) external onlyOwner {
-        IERC20(asset()).safeTransfer(to, amount);
+        uint256 activeAt = capitalDestinationActiveAt[to];
+        if (activeAt == 0 || block.timestamp < activeAt) revert DestinationNotWhitelisted();
+        IERC20 token = IERC20(asset());
+        if (token.balanceOf(address(this)) < amount + settledUnclaimedAssets) revert InsufficientIdle();
+        token.safeTransfer(to, amount);
     }
 
     function capitalDeposit(uint256 amount) external onlyOwner {
@@ -365,5 +512,5 @@ contract AtomaVault is ERC4626Upgradeable, UUPSUpgradeable, PausableUpgradeable,
 
     function _authorizeUpgrade(address) internal override onlyOwner {}
 
-    uint256[43] private __gap;
+    uint256[35] private __gap;
 }
